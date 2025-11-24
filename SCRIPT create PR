@@ -1,0 +1,188 @@
+/**
+ * Usage:
+ * 1) npm install @octokit/rest jsonwebtoken glob fs-extra
+ * 2) export GITHUB_APP_ID=2345205              # tu App ID 2345205
+ * 3) export PRIVATE_KEY_PATH=./luxe-clean-theme.private-key.pem
+ * 4) export REPO_OWNER=pablobf84
+ * 5) export REPO_NAME=luxe-clean-theme         # o Seniorpetscare si es ese repo
+ * 6) export BRANCH=feature/luxe-shopify-theme
+ * 7) (opcional) export INSTALLATION_ID=123456  # si ya lo conoces
+ * 8) node scripts/create-pr-via-app.js
+ *
+ * El script listará instalaciones si no hay INSTALLATION_ID, generará token de instalación,
+ * creará la rama y subirá todos los archivos desde ./theme-files/.
+ *
+ * Nota: Revoca la clave privada / token cuando termines.
+ */
+const fs = require('fs');
+const path = require('path');
+const jwt = require('jsonwebtoken');
+const glob = require('glob');
+const { Octokit } = require('@octokit/rest');
+const fse = require('fs-extra');
+
+const APP_ID = process.env.GITHUB_APP_ID;
+const PRIVATE_KEY_PATH = process.env.PRIVATE_KEY_PATH || './luxe-clean-theme.private-key.pem';
+const OWNER = process.env.REPO_OWNER;
+const REPO = process.env.REPO_NAME;
+const BRANCH = process.env.BRANCH || 'feature/luxe-shopify-theme';
+let INSTALLATION_ID = process.env.INSTALLATION_ID; // optional
+
+if (!APP_ID || !fs.existsSync(PRIVATE_KEY_PATH) || !OWNER || !REPO) {
+  console.error('Faltan variables: asegúrate de definir GITHUB_APP_ID, PRIVATE_KEY_PATH, REPO_OWNER y REPO_NAME');
+  process.exit(1);
+}
+
+async function generateJWT() {
+  const privateKey = fs.readFileSync(PRIVATE_KEY_PATH, 'utf8');
+  const now = Math.floor(Date.now() / 1000);
+  const payload = { iat: now - 30, exp: now + 9 * 60, iss: APP_ID };
+  return jwt.sign(payload, privateKey, { algorithm: 'RS256' });
+}
+
+async function getInstallationToken(jwtToken) {
+  const octokitApp = new Octokit({
+    auth: jwtToken,
+    userAgent: 'luxe-clean-uploader'
+  });
+
+  if (!INSTALLATION_ID) {
+    console.log('Listando instalaciones de la App (busca la que corresponda a este repo)...');
+    const res = await octokitApp.request('GET /app/installations');
+    if (!res.data || res.data.length === 0) {
+      throw new Error('No hay instalaciones de la App. Instálala en el repositorio primero.');
+    }
+    console.log('Instalaciones encontradas:');
+    res.data.forEach(i => console.log(`- id: ${i.id}, account: ${i.account && i.account.login}`));
+    // Si hay una instalación única en el owner indicado, preferimos esa:
+    const found = res.data.find(i => i.account && i.account.login === OWNER);
+    if (found) {
+      INSTALLATION_ID = found.id;
+      console.log('Usando installation id detectado:', INSTALLATION_ID);
+    } else {
+      throw new Error('Múltiples instalaciones o ninguna coincide con REPO_OWNER. Define INSTALLATION_ID en env.');
+    }
+  }
+
+  const tokenRes = await octokitApp.request('POST /app/installations/{installation_id}/access_tokens', {
+    installation_id: INSTALLATION_ID
+  });
+
+  return tokenRes.data.token;
+}
+
+async function branchExists(octokit, ref) {
+  try {
+    await octokit.repos.getRef({ owner: OWNER, repo: REPO, ref });
+    return true;
+  } catch (err) {
+    if (err.status === 404) return false;
+    throw err;
+  }
+}
+
+async function ensureBranch(octokit, newBranch) {
+  const baseRef = 'heads/main';
+  const baseRefData = await octokit.repos.getRef({ owner: OWNER, repo: REPO, ref: baseRef });
+  const baseSha = baseRefData.data.object.sha;
+
+  const newRef = `refs/heads/${newBranch}`;
+  if (await branchExists(octokit, `heads/${newBranch}`)) {
+    console.log(`La rama ${newBranch} ya existe.`);
+    return;
+  }
+  console.log(`Creando rama ${newBranch} desde main (${baseSha})...`);
+  await octokit.git.createRef({
+    owner: OWNER,
+    repo: REPO,
+    ref: newRef,
+    sha: baseSha
+  });
+  console.log('Rama creada.');
+}
+
+async function uploadFiles(octokit, branch, sourceDir) {
+  // Recorrer todos los archivos dentro sourceDir
+  const pattern = `${sourceDir}/**/*`;
+  const files = glob.sync(pattern, { nodir: true });
+  console.log(`Se subirán ${files.length} archivos desde ${sourceDir}`);
+  for (const filePath of files) {
+    const relPath = path.relative(sourceDir, filePath).replace(/\\/g, '/');
+    const content = fs.readFileSync(filePath);
+    const b64 = content.toString('base64');
+    const apiPath = relPath; // sube exactamente en la raíz del repo esos paths
+    console.log(`Subiendo: ${apiPath}`);
+    // Check if file exists to use update vs create
+    try {
+      const existing = await octokit.repos.getContent({ owner: OWNER, repo: REPO, path: apiPath, ref: branch });
+      // update
+      await octokit.repos.createOrUpdateFileContents({
+        owner: OWNER,
+        repo: REPO,
+        path: apiPath,
+        message: `chore(theme): update ${apiPath}`,
+        content: b64,
+        sha: existing.data.sha,
+        branch
+      });
+    } catch (err) {
+      if (err.status === 404) {
+        // create
+        await octokit.repos.createOrUpdateFileContents({
+          owner: OWNER,
+          repo: REPO,
+          path: apiPath,
+          message: `chore(theme): add ${apiPath}`,
+          content: b64,
+          branch
+        });
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+async function createPullRequest(octokit, headBranch) {
+  const title = 'feat(theme): add LuxeClean theme (feature/luxe-shopify-theme)';
+  const body = `This PR adds the LuxeClean Shopify theme files (layout, sections, snippets, assets, config, templates).
+  
+- Branch: ${headBranch}
+- Review and test in Shopify Theme Editor before publishing.`;
+
+  const pr = await octokit.pulls.create({
+    owner: OWNER,
+    repo: REPO,
+    title,
+    head: headBranch,
+    base: 'main',
+    body
+  });
+  return pr.data.html_url;
+}
+
+(async () => {
+  try {
+    const jwtToken = await generateJWT();
+    const installationToken = await getInstallationToken(jwtToken);
+    const octokit = new Octokit({ auth: installationToken, userAgent: 'luxe-clean-uploader' });
+
+    // Create branch
+    await ensureBranch(octokit, BRANCH);
+
+    // Upload files from ./theme-files
+    const sourceDir = path.resolve('./theme-files');
+    if (!fs.existsSync(sourceDir)) {
+      console.error('No existe ./theme-files con los archivos a subir. Crea la carpeta y añade los archivos del tema.');
+      process.exit(1);
+    }
+    await uploadFiles(octokit, BRANCH, sourceDir);
+
+    // Open PR
+    const prUrl = await createPullRequest(octokit, BRANCH);
+    console.log('PR creado:', prUrl);
+  } catch (err) {
+    console.error('Error:', err.message || err);
+    process.exit(1);
+  }
+})();
